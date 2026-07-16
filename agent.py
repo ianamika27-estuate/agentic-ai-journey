@@ -82,6 +82,13 @@ TOOLS = [
             "required": ["filename", "content"],
         },
     },
+    {
+        "name": "run_tests",
+        "description": "Run the pytest suite and return the result. Call this after "
+                        "write_file to verify your fix actually worked before finishing. "
+                        "If it still fails, keep investigating and fixing.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
 ]
 
 
@@ -100,6 +107,11 @@ def execute_tool(name: str, tool_input: dict) -> str:
         path = TEST_DIR / tool_input["filename"]
         path.write_text(tool_input["content"])
         return f"Wrote {tool_input['filename']} successfully"
+
+    if name == "run_tests":
+        passed, output = run_tests()
+        status = "ALL TESTS PASSED" if passed else "TESTS STILL FAILING"
+        return f"{status}\n\n{output}"
 
     return f"Error: unknown tool '{name}'"
 
@@ -205,15 +217,19 @@ def run_agent_with_tools(test_output: str) -> None:
         "role": "user",
         "content": (
             "The test suite for this project is failing. You have tools to "
-            "explore the project yourself and fix it. Here is the pytest output:\n\n"
+            "explore the project yourself and fix it. Here is the initial pytest output:\n\n"
             f"```\n{test_output}\n```\n\n"
             "Use list_files and read_file to figure out which source file is "
             "broken, then use write_file to apply a corrected version of that "
-            "file. Fix only what's needed to make the tests pass."
+            "file. Fix only what's needed to make the tests pass.\n\n"
+            "IMPORTANT: After every write_file call, call run_tests to verify "
+            "your fix actually worked. If it still fails, keep investigating — "
+            "don't assume you're done until run_tests reports ALL TESTS PASSED."
         ),
     }]
 
-    for turn in range(1, 11):  # cap tool-use turns per fix attempt
+    for turn in range(1, 16):  # cap tool-use turns per fix attempt (higher now that
+                                # verification via run_tests adds extra round-trips)
         response = client.messages.create(
             model=MODEL,
             max_tokens=1500,
