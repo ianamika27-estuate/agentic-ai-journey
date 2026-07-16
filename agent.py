@@ -162,6 +162,21 @@ def git_revert_to_last_commit() -> None:
     print("[git] reverted tasks/ to last good commit (regression detected)")
 
 
+def git_push() -> None:
+    """Push to the configured remote, if one exists. Safe no-op otherwise —
+    this demo works fully offline unless you've added a remote yourself."""
+    remotes = git("remote").stdout.strip()
+    if not remotes:
+        print("[git] no remote configured — skipping push (run `git remote add origin <url>` to enable)")
+        return
+    branch = git("branch", "--show-current").stdout.strip() or "main"
+    result = git("push", "origin", branch)
+    if result.returncode == 0:
+        print(f"[git] pushed to origin/{branch}")
+    else:
+        print(f"[git] push failed: {result.stderr.strip()}")
+
+
 def count_failures(test_output: str) -> int:
     match = re.search(r"(\d+) failed", test_output)
     return int(match.group(1)) if match else 0
@@ -248,9 +263,37 @@ def ask_llm_for_fix(code: str, test_output: str) -> str:
     return ask_claude_for_fix(code, test_output)
 
 
+def get_plan(test_output: str) -> str:
+    """Ask Claude to think through its approach BEFORE touching any files or
+    calling any tools. This is a separate, tool-less call — forcing a plan
+    first (rather than reacting turn-by-turn) is what separates planning
+    from pure reaction."""
+
+    response = client.messages.create(
+        model=MODEL,
+        max_tokens=500,
+        messages=[{
+            "role": "user",
+            "content": (
+                "A test suite is failing. Do NOT call any tools yet — just "
+                "think out loud in plain text.\n\n"
+                f"pytest output:\n```\n{test_output}\n```\n\n"
+                "Write a short plan (3-5 bullet points): which source file(s) "
+                "the traceback implicates, what you suspect is wrong in each, "
+                "and the order you'll investigate them in."
+            ),
+        }],
+    )
+    plan = "".join(b.text for b in response.content if b.type == "text").strip()
+    print(f"    [plan]\n{plan}\n")
+    return plan
+
+
 def run_agent_with_tools(test_output: str) -> None:
     """Give Claude tools and let it discover which file is broken, inspect
     it, and fix it — no file path handed to it up front."""
+
+    plan = get_plan(test_output)
 
     messages = [{
         "role": "user",
@@ -258,9 +301,10 @@ def run_agent_with_tools(test_output: str) -> None:
             "The test suite for this project is failing. You have tools to "
             "explore the project yourself and fix it. Here is the initial pytest output:\n\n"
             f"```\n{test_output}\n```\n\n"
-            "Use list_files and read_file to figure out which source file is "
-            "broken, then use write_file to apply a corrected version of that "
-            "file. Fix only what's needed to make the tests pass.\n\n"
+            f"You already drafted this plan:\n{plan}\n\n"
+            "Now execute it using list_files, read_file, and write_file. Follow "
+            "your plan, but adapt if what you find in a file doesn't match what "
+            "you expected.\n\n"
             "IMPORTANT: After every write_file call, call run_tests to verify "
             "your fix actually worked. If it still fails, keep investigating — "
             "don't assume you're done until run_tests reports ALL TESTS PASSED."
@@ -328,6 +372,7 @@ def main():
             print("✅ All tests passing. Done.")
             print(output)
             git_commit_snapshot(f"fix: all tests passing (iteration {i})")
+            git_push()
             return
 
         print(f"❌ {failures} test(s) failing. Asking {PROVIDER} for a fix...")
