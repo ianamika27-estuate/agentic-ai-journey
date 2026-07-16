@@ -289,29 +289,64 @@ def get_plan(test_output: str) -> str:
     return plan
 
 
-def run_agent_with_tools(test_output: str) -> None:
+def run_agent_with_tools(messages: list, test_output: str, was_reverted: bool = False) -> list:
     """Give Claude tools and let it discover which file is broken, inspect
-    it, and fix it — no file path handed to it up front."""
+    it, and fix it — no file path handed to it up front.
 
-    plan = get_plan(test_output)
+    `messages` is the FULL conversation so far, passed in and returned back
+    out. On the first call it's empty, so we plan fresh. On later calls
+    (i.e. a previous attempt didn't fully succeed), it already contains
+    everything the model tried before — so it doesn't repeat a dead end.
 
-    messages = [{
-        "role": "user",
-        "content": (
-            "The test suite for this project is failing. You have tools to "
-            "explore the project yourself and fix it. Here is the initial pytest output:\n\n"
-            f"```\n{test_output}\n```\n\n"
-            f"You already drafted this plan:\n{plan}\n\n"
-            "Now execute it using list_files, read_file, and write_file. Follow "
-            "your plan, but adapt if what you find in a file doesn't match what "
-            "you expected.\n\n"
-            "IMPORTANT: After every write_file call, call run_tests to verify "
-            "your fix actually worked. If it still fails, keep investigating — "
-            "don't assume you're done until run_tests reports ALL TESTS PASSED."
-        ),
-    }]
+    `was_reverted` flags that the outer loop just git-reverted the last
+    edit because it was a regression — the model's own history still thinks
+    that edit succeeded, so we need to correct that belief explicitly."""
 
-    for turn in range(1, 16):  # cap tool-use turns per fix attempt (higher now that
+    if not messages:
+        # First attempt: plan from scratch, no prior history to draw on.
+        plan = get_plan(test_output)
+        messages.append({
+            "role": "user",
+            "content": (
+                "The test suite for this project is failing. You have tools to "
+                "explore the project yourself and fix it. Here is the initial pytest output:\n\n"
+                f"```\n{test_output}\n```\n\n"
+                f"You already drafted this plan:\n{plan}\n\n"
+                "Now execute it using list_files, read_file, and write_file. Follow "
+                "your plan, but adapt if what you find in a file doesn't match what "
+                "you expected.\n\n"
+                "IMPORTANT: After every write_file call, call run_tests to verify "
+                "your fix actually worked. If it still fails, keep investigating — "
+                "don't assume you're done until run_tests reports ALL TESTS PASSED."
+            ),
+        })
+    else:
+        # A previous attempt ended without full success. Feed it the latest
+        # failure state as a new turn in the SAME conversation — everything
+        # it already tried (and what happened) is still right there above.
+        revert_note = (
+            "IMPORTANT CORRECTION: your last write_file call made things "
+            "WORSE (more failures than before), so it was automatically "
+            "reverted — that file is back to how it was before your last "
+            "edit, regardless of what any earlier tool result told you. "
+            "Re-read the file with read_file before touching it again; "
+            "don't assume your previous edit is still in place.\n\n"
+        ) if was_reverted else ""
+
+        messages.append({
+            "role": "user",
+            "content": (
+                f"{revert_note}"
+                "Tests are still failing after your last attempt. Here is the "
+                "current pytest output:\n\n"
+                f"```\n{test_output}\n```\n\n"
+                "Don't repeat something you already tried that didn't work — "
+                "look back at what you did above and try a different angle. "
+                "Continue using the tools until run_tests reports ALL TESTS PASSED."
+            ),
+        })
+
+    for turn in range(1, 16):  # cap tool-use turns per call (higher now that
                                 # verification via run_tests adds extra round-trips)
         response = client.messages.create(
             model=MODEL,
@@ -327,7 +362,7 @@ def run_agent_with_tools(test_output: str) -> None:
             text_blocks = [b.text for b in response.content if b.type == "text"]
             if text_blocks:
                 print(f"    [model] {' '.join(text_blocks)}")
-            return
+            return messages
 
         tool_results = []
         for block in response.content:
@@ -343,6 +378,7 @@ def run_agent_with_tools(test_output: str) -> None:
         messages.append({"role": "user", "content": tool_results})
 
     print("    [warning] hit tool-use turn cap without the model finishing")
+    return messages
 
 
 def main():
@@ -350,11 +386,16 @@ def main():
     print(f"Starting agentic loop (max {MAX_ITERATIONS} iterations)\n")
 
     prev_failures = None  # failure count as of the last committed state
+    just_reverted = False  # did we revert a regression THIS iteration?
+    agent_messages = []   # persistent tool-use conversation — survives across
+                           # outer iterations so the agent remembers what it
+                           # already tried (only used when USE_TOOLS=1)
 
     for i in range(1, MAX_ITERATIONS + 1):
         print(f"--- Iteration {i} ---")
         passed, output = run_tests()
         failures = count_failures(output)
+        just_reverted = False
 
         if prev_failures is not None:
             if failures > prev_failures:
@@ -364,6 +405,7 @@ def main():
                 git_revert_to_last_commit()
                 passed, output = run_tests()
                 failures = count_failures(output)
+                just_reverted = True
             else:
                 # Last attempt was neutral or an improvement — keep it.
                 git_commit_snapshot(f"attempt {i - 1}: failures {prev_failures} -> {failures}")
@@ -380,7 +422,7 @@ def main():
         if USE_TOOLS:
             if PROVIDER != "anthropic":
                 raise SystemExit("USE_TOOLS=1 requires PROVIDER=anthropic")
-            run_agent_with_tools(output)
+            agent_messages = run_agent_with_tools(agent_messages, output, was_reverted=just_reverted)
             print("    Applied fix via tools. Re-running tests...\n")
             prev_failures = failures
             continue
