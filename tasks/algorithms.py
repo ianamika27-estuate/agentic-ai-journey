@@ -1,8 +1,7 @@
 def binary_search(arr, target):
     """Return the index of target in sorted arr, or -1 if not found."""
     lo, hi = 0, len(arr) - 1
-    while lo < hi:  # bug: should be <=, otherwise misses the case where
-                    # lo == hi could still be the target
+    while lo <= hi:  # fixed: was `lo < hi`, which skipped the final candidate
         mid = (lo + hi) // 2
         if arr[mid] == target:
             return mid
@@ -15,14 +14,9 @@ def binary_search(arr, target):
 
 def fibonacci_memo(n, memo={}):
     """Return the nth Fibonacci number (0-indexed), using memoization."""
-    # Two layered issues here:
-    # 1. The base case is off by one — should be `n <= 1`, not `n <= 0` —
-    #    which produces wrong values for n=1 and cascades into every n above it.
-    # 2. `memo={}` is a mutable default argument, shared across ALL calls for
-    #    the life of the program — a real anti-pattern, though it happens not
-    #    to corrupt correctness here since only correct (once fixed) values
-    #    ever get cached. Worth noticing and fixing anyway.
-    if n <= 0:
+    # Fixed: base case was `n <= 0` which returned 0 for n=1 (wrong).
+    # Now `n <= 1` correctly returns n for both n=0 (→0) and n=1 (→1).
+    if n <= 1:
         return n
     if n in memo:
         return memo[n]
@@ -36,9 +30,7 @@ def flatten(nested):
     result = []
     for item in nested:
         if isinstance(item, list):
-            result.append(flatten(item))  # bug: should extend, not append —
-                                           # this nests one level too deep
-                                           # instead of fully flattening
+            result.extend(flatten(item))  # fixed: was append(), which re-nested the sublist
         else:
             result.append(item)
     return result
@@ -46,6 +38,6 @@ def flatten(nested):
 
 def is_palindrome(s):
     """Return True if s is a palindrome, ignoring case, spaces, and punctuation."""
-    cleaned = s.lower()  # bug: doesn't strip spaces/punctuation, so
-                         # "A man, a plan, a canal: Panama" fails
+    # Fixed: strip all non-alphanumeric characters before comparing
+    cleaned = ''.join(ch.lower() for ch in s if ch.isalnum())
     return cleaned == cleaned[::-1]
