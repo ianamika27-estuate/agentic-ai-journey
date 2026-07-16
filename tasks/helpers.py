@@ -1,6 +1,6 @@
 def to_uppercase(s):
     """Should return the string in all uppercase."""
-    return s.lower()  # bug: should be s.upper()
+    return s.upper()
 
 
 def count_vowels(s):
