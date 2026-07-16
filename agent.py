@@ -36,6 +36,11 @@ TASK_FILE = Path(__file__).parent / "tasks" / "buggy.py"
 TEST_DIR = Path(__file__).parent / "tasks"
 MAX_ITERATIONS = 6
 
+# USE_TOOLS=1 -> agent discovers which file is broken itself via tools
+#              (list_files/read_file/write_file), instead of being handed
+#              TASK_FILE directly. Anthropic only.
+USE_TOOLS = os.environ.get("USE_TOOLS", "0") == "1"
+
 if PROVIDER == "anthropic":
     _key = os.environ.get("ANTHROPIC_API_KEY")
     print(f"[debug] ANTHROPIC_API_KEY loaded: {'yes -> ' + _key[:10] + '...' if _key else 'NO — not found'}")
@@ -44,6 +49,59 @@ else:
     client = None
 
 print(f"[debug] Using provider: {PROVIDER} ({MODEL if PROVIDER == 'anthropic' else OLLAMA_MODEL})")
+
+# --- Tools the agent can use to explore and fix the project itself,
+#     instead of being handed a hardcoded file path. Anthropic tool-use
+#     format only — Ollama tool calling is too inconsistent for this demo. ---
+
+TOOLS = [
+    {
+        "name": "list_files",
+        "description": "List all Python source files (not test files) in the tasks directory.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "read_file",
+        "description": "Read the full contents of a file in the tasks directory.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"filename": {"type": "string", "description": "e.g. 'buggy.py'"}},
+            "required": ["filename"],
+        },
+    },
+    {
+        "name": "write_file",
+        "description": "Overwrite a file in the tasks directory with corrected content. "
+                        "Call this once you've identified and fixed the bug.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "filename": {"type": "string"},
+                "content": {"type": "string", "description": "The complete new file content."},
+            },
+            "required": ["filename", "content"],
+        },
+    },
+]
+
+
+def execute_tool(name: str, tool_input: dict) -> str:
+    if name == "list_files":
+        files = sorted(f.name for f in TEST_DIR.glob("*.py") if not f.name.startswith("test_"))
+        return json.dumps(files)
+
+    if name == "read_file":
+        path = TEST_DIR / tool_input["filename"]
+        if not path.exists():
+            return f"Error: {tool_input['filename']} not found"
+        return path.read_text()
+
+    if name == "write_file":
+        path = TEST_DIR / tool_input["filename"]
+        path.write_text(tool_input["content"])
+        return f"Wrote {tool_input['filename']} successfully"
+
+    return f"Error: unknown tool '{name}'"
 
 
 def run_tests() -> tuple[bool, str]:
@@ -139,6 +197,55 @@ def ask_llm_for_fix(code: str, test_output: str) -> str:
     return ask_claude_for_fix(code, test_output)
 
 
+def run_agent_with_tools(test_output: str) -> None:
+    """Give Claude tools and let it discover which file is broken, inspect
+    it, and fix it — no file path handed to it up front."""
+
+    messages = [{
+        "role": "user",
+        "content": (
+            "The test suite for this project is failing. You have tools to "
+            "explore the project yourself and fix it. Here is the pytest output:\n\n"
+            f"```\n{test_output}\n```\n\n"
+            "Use list_files and read_file to figure out which source file is "
+            "broken, then use write_file to apply a corrected version of that "
+            "file. Fix only what's needed to make the tests pass."
+        ),
+    }]
+
+    for turn in range(1, 11):  # cap tool-use turns per fix attempt
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=1500,
+            tools=TOOLS,
+            messages=messages,
+        )
+
+        messages.append({"role": "assistant", "content": response.content})
+
+        if response.stop_reason != "tool_use":
+            # Model stopped calling tools — either it's done or it's stuck.
+            text_blocks = [b.text for b in response.content if b.type == "text"]
+            if text_blocks:
+                print(f"    [model] {' '.join(text_blocks)}")
+            return
+
+        tool_results = []
+        for block in response.content:
+            if block.type == "tool_use":
+                print(f"    [tool call] {block.name}({block.input})")
+                result = execute_tool(block.name, block.input)
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": result,
+                })
+
+        messages.append({"role": "user", "content": tool_results})
+
+    print("    [warning] hit tool-use turn cap without the model finishing")
+
+
 def main():
     print(f"Starting agentic loop (max {MAX_ITERATIONS} iterations)\n")
 
@@ -152,6 +259,14 @@ def main():
             return
 
         print(f"❌ Tests failing. Asking {PROVIDER} for a fix...")
+
+        if USE_TOOLS:
+            if PROVIDER != "anthropic":
+                raise SystemExit("USE_TOOLS=1 requires PROVIDER=anthropic")
+            run_agent_with_tools(output)
+            print("    Applied fix via tools. Re-running tests...\n")
+            continue
+
         current_code = TASK_FILE.read_text()
 
         try:

@@ -19,7 +19,9 @@ export ANTHROPIC_API_KEY=sk-...   # your key
 ## Run
 
 ```bash
+source path/to/venv/bin/activate
 python agent.py
+PROVIDER=anthropic python agent.py
 ```
 
 You'll see it:
