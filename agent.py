@@ -128,6 +128,45 @@ def run_tests() -> tuple[bool, str]:
     return result.returncode == 0, output
 
 
+# --- Version control: give the agent a safety net. Every fix attempt gets
+#     snapshotted, and if a fix makes things WORSE (more failures than
+#     before), we auto-revert instead of letting the agent keep digging a
+#     hole from a bad state. ---
+
+PROJECT_ROOT = Path(__file__).parent
+
+
+def git(*args) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", *args], cwd=PROJECT_ROOT, capture_output=True, text=True)
+
+
+def ensure_git_repo() -> None:
+    """Init a repo and commit the starting (buggy) state if not already tracked."""
+    if not (PROJECT_ROOT / ".git").exists():
+        git("init", "-q")
+        git("add", "-A")
+        git("commit", "-q", "-m", "baseline: initial buggy state")
+        print("[git] initialized repo, committed baseline snapshot")
+
+
+def git_commit_snapshot(message: str) -> None:
+    git("add", "-A")
+    result = git("commit", "-q", "-m", message)
+    if result.returncode == 0:
+        print(f"[git] committed: {message}")
+
+
+def git_revert_to_last_commit() -> None:
+    """Discard uncommitted changes in tasks/ — used when a fix regresses."""
+    git("checkout", "--", "tasks/")
+    print("[git] reverted tasks/ to last good commit (regression detected)")
+
+
+def count_failures(test_output: str) -> int:
+    match = re.search(r"(\d+) failed", test_output)
+    return int(match.group(1)) if match else 0
+
+
 def ask_claude_for_fix(code: str, test_output: str) -> str:
     """Send the current code + failing test output to Claude, get back
     a full corrected version of the file."""
@@ -263,24 +302,42 @@ def run_agent_with_tools(test_output: str) -> None:
 
 
 def main():
+    ensure_git_repo()
     print(f"Starting agentic loop (max {MAX_ITERATIONS} iterations)\n")
+
+    prev_failures = None  # failure count as of the last committed state
 
     for i in range(1, MAX_ITERATIONS + 1):
         print(f"--- Iteration {i} ---")
         passed, output = run_tests()
+        failures = count_failures(output)
+
+        if prev_failures is not None:
+            if failures > prev_failures:
+                # Last attempt made things worse and was NEVER committed —
+                # checkout safely discards it and restores the last good state.
+                print(f"⚠️ Regression: failures went {prev_failures} -> {failures}. Reverting last fix.")
+                git_revert_to_last_commit()
+                passed, output = run_tests()
+                failures = count_failures(output)
+            else:
+                # Last attempt was neutral or an improvement — keep it.
+                git_commit_snapshot(f"attempt {i - 1}: failures {prev_failures} -> {failures}")
 
         if passed:
             print("✅ All tests passing. Done.")
             print(output)
+            git_commit_snapshot(f"fix: all tests passing (iteration {i})")
             return
 
-        print(f"❌ Tests failing. Asking {PROVIDER} for a fix...")
+        print(f"❌ {failures} test(s) failing. Asking {PROVIDER} for a fix...")
 
         if USE_TOOLS:
             if PROVIDER != "anthropic":
                 raise SystemExit("USE_TOOLS=1 requires PROVIDER=anthropic")
             run_agent_with_tools(output)
             print("    Applied fix via tools. Re-running tests...\n")
+            prev_failures = failures
             continue
 
         current_code = TASK_FILE.read_text()
@@ -292,11 +349,13 @@ def main():
             continue
 
         TASK_FILE.write_text(new_code)
-        print("    Applied fix. Re-running tests...\n")
+        print("    Applied fix (uncommitted — verified next iteration). Re-running tests...\n")
+        prev_failures = failures
 
     print(f"⚠️ Gave up after {MAX_ITERATIONS} iterations without all tests passing.")
     _, final_output = run_tests()
     print(final_output)
+    print(f"[git] history preserved — run `git log --oneline` in {PROJECT_ROOT} to see every kept attempt")
 
 
 if __name__ == "__main__":
