@@ -1,6 +1,6 @@
 def add_numbers(a, b):
     """Should return the sum of a and b."""
-    return a + b
+    return a - b
 
 
 def reverse_string(s):
@@ -15,4 +15,4 @@ def is_even(n):
 
 def subtract_numbers(a, b):
     """Should return the difference of a and b."""
-    return a - b
+    return a * b
